@@ -1,77 +1,60 @@
-import express from "express";
-import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
+import crypto from "crypto";
 
-const app = express();
+// 🚨 HARD FAIL if env vars are missing
+if (!process.env.SUPABASE_URL) {
+  throw new Error("SUPABASE_URL is missing");
+}
 
-/**
- * Whop requires RAW body for signature verification
- */
-app.use("/webhooks/whop", express.raw({ type: "application/json" }));
+if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing");
+}
 
-/**
- * Supabase admin client
- * ❗ Will crash if env vars are missing (as it should)
- */
+if (!process.env.WHOP_WEBHOOK_SECRET) {
+  throw new Error("WHOP_WEBHOOK_SECRET is missing");
+}
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
 );
 
-/**
- * Verify Whop webhook signature
- */
-function verifyWhopSignature(req) {
-  const signature = req.headers["x-whop-signature"];
-  if (!signature) return false;
+export default async function handler(req, res) {
+  if (req.method === "GET") {
+    return res.status(200).send("Mate backend running");
+  }
 
-  const expected = crypto
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  const signature = req.headers["x-whop-signature"];
+  if (!signature) {
+    return res.status(401).json({ error: "Missing signature" });
+  }
+
+  const rawBody = JSON.stringify(req.body);
+  const expectedSignature = crypto
     .createHmac("sha256", process.env.WHOP_WEBHOOK_SECRET)
-    .update(req.body)
+    .update(rawBody)
     .digest("hex");
 
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  if (signature !== expectedSignature) {
+    return res.status(401).json({ error: "Invalid signature" });
+  }
+
+  const event = req.body;
+
+  if (event.type === "payment.succeeded") {
+    const { user_id, plan_id } = event.data;
+
+    await supabase.from("subscriptions").upsert({
+      user_id,
+      plan_id,
+      active: true,
+      updated_at: new Date().toISOString(),
+    });
+  }
+
+  return res.status(200).json({ received: true });
 }
-
-/**
- * WHOP WEBHOOK
- */
-app.post("/webhooks/whop", async (req, res) => {
-  if (!verifyWhopSignature(req)) {
-    return res.status(401).send("Invalid signature");
-  }
-
-  const event = JSON.parse(req.body.toString());
-  const { type, data } = event;
-
-  try {
-    if (type === "membership_activated") {
-      await supabase.from("entitlements").upsert({
-        user_id: data.user_id,
-        plan_id: data.product_id,
-        active: true,
-      });
-    }
-
-    if (type === "membership_deactivated") {
-      await supabase
-        .from("entitlements")
-        .update({ active: false })
-        .eq("user_id", data.user_id);
-    }
-
-    res.status(200).send("OK");
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Server error");
-  }
-});
-
-/**
- * Health check
- */
-app.get("/", (req, res) => {
-  res.send("Mate backend running");
-});
-
-export default app;
